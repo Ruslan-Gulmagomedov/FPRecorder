@@ -48,7 +48,7 @@ public:
 			}
 			return 0; // Success
 		}
-		catch (const std::exception& e) {
+		catch (const std::exception&) {
 			return -1; // Exception occurred
 		}
 	}

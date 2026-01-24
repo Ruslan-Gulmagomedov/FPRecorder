@@ -379,7 +379,6 @@ static int ExecSystemCmd(const std::string& str, std::string& out)
 	{
 		// Wait for a while to allow the process to work
 		wait(5);
-		void;
 		DWORD ret = WaitForSingleObject(pi.hProcess, 50);
 		if (gui::try_close) {
 			int result = alert(L"FPWarning", L"You are attempting to close the program while it is converting a recording to another format. If the recording is lengthy, please wait a bit longer. If you believe the program has frozen and will not complete the conversion, click \"Yes\".", MB_YESNO | MB_ICONEXCLAMATION);
@@ -1801,11 +1800,18 @@ public:
 
 	bool validate_and_prepare_settings() {
 		std::wstring ws_val = get_text(editSampleRate); std::string s_val; CStringUtils::UnicodeConvert(ws_val, s_val);
-		try { std::stoul(s_val); }
+		try {
+			const auto sample_rate_value = std::stoul(s_val);
+			if (sample_rate_value == 0) {
+				alert(L"Validation Error", L"Invalid Sample Rate. Must be a positive number.", MB_ICONERROR);
+				focus(editSampleRate);
+				return false;
+			}
+		}
 		catch (const std::exception&) { alert(L"Validation Error", L"Invalid Sample Rate. Must be a positive number.", MB_ICONERROR); focus(editSampleRate); return false; }
 
 		ws_val = get_text(editBufferSize); CStringUtils::UnicodeConvert(ws_val, s_val);
-		try { std::stoul(s_val); }
+		try { (void)std::stoul(s_val); }
 		catch (const std::exception&) { alert(L"Validation Error", L"Invalid Buffer Size. Must be a number.", MB_ICONERROR); focus(editBufferSize); return false; }
 
 		DWORD kmod_dummy; int kcode_dummy;
@@ -2172,22 +2178,34 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, wchar_t* lpCmd
 		conf.save();
 		hotkey_start_stop = conf.read("General", "hotkey-start-stop");
 		if (parse_hotkey(hotkey_start_stop, kmod, kcode) == false) {
-			throw std::exception("Invalid hotkey");
+			alert(L"FPConfigParsingError", L"Invalid hotkey.", MB_ICONERROR);
+			g_Retcode = -2;
+			g_Running = false;
+			return g_Retcode;
 		}
 		RegisterHotKey(nullptr, HOTKEY_STARTSTOP, kmod, kcode);
 		hotkey_pause_resume = conf.read("General", "hotkey-pause-resume");
 		if (parse_hotkey(hotkey_pause_resume, kmod, kcode) == false) {
-			throw std::exception("Invalid hotkey");
+			alert(L"FPConfigParsingError", L"Invalid hotkey.", MB_ICONERROR);
+			g_Retcode = -2;
+			g_Running = false;
+			return g_Retcode;
 		}
 		RegisterHotKey(nullptr, HOTKEY_PAUSERESUME, kmod, kcode);
 		hotkey_restart = conf.read("General", "hotkey-restart");
 		if (parse_hotkey(hotkey_restart, kmod, kcode) == false) {
-			throw std::exception("Invalid hotkey");
+			alert(L"FPConfigParsingError", L"Invalid hotkey.", MB_ICONERROR);
+			g_Retcode = -2;
+			g_Running = false;
+			return g_Retcode;
 		}
 		RegisterHotKey(nullptr, HOTKEY_RESTART, kmod, kcode);
 		hotkey_hide_show = conf.read("General", "hotkey-hide-show");
 		if (parse_hotkey(hotkey_hide_show, kmod, kcode) == false) {
-			throw std::exception("Invalid hotkey");
+			alert(L"FPConfigParsingError", L"Invalid hotkey.", MB_ICONERROR);
+			g_Retcode = -2;
+			g_Running = false;
+			return g_Retcode;
 		}
 		RegisterHotKey(nullptr, HOTKEY_HIDESHOW, kmod, kcode);
 
