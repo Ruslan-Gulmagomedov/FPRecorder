@@ -3,6 +3,7 @@
 #include "gui/gui.h"
 #include "Provider.h"
 #include "user_config.h"
+#include "localization.h"
 #include <cctype>
 #include <deque>
 #include<filesystem>
@@ -10,6 +11,7 @@
 #include <ole2.h>
 #include <shlobj_core.h>
 #include <stacktrace>
+#include <stdexcept>
 #include <tlhelp32.h>
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
@@ -31,6 +33,7 @@
 #include <exception>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <condition_variable>
 #include <string_view>
 
@@ -38,6 +41,8 @@
 #include <mmdeviceapi.h>
 #include <audioclientactivationparams.h>
 #include <mfapi.h>
+#include <commctrl.h>
+#include <urlmon.h>
 
 
 template<typename T, typename Func, typename ...Args>
@@ -278,12 +283,17 @@ enum SourceType {
 
 struct application {
 	std::wstring name;
+	std::wstring window_title; // visible window title, empty for plain processes
 	ma_uint32 id;
 };
 
 struct ConfiguredSource {
 	std::wstring custom_name;
 	SourceType type;
+
+	// Whether this source takes part in the next recording. A source can be
+	// switched off in the main window without removing it from the list.
+	bool enabled = true;
 
 	audio_device device;
 	application app;
@@ -294,6 +304,143 @@ static std::vector<ConfiguredSource> g_ConfiguredSources;
 static std::string current_preset_name = g_Presets[0].name;
 
 static user_config conf("fp.ini");
+
+// --- Configured sources: persistence, display, re-resolution -------------
+
+static const wchar_t* source_type_label(SourceType type) {
+	switch (type) {
+	case DEVICE_CAPTURE: return tr(L"Microphone", L"Микрофон");
+	case DEVICE_LOOPBACK: return tr(L"Loopback", L"Системный звук");
+	case APP_LOOPBACK: return tr(L"Application", L"Приложение");
+	}
+	return L"";
+}
+
+static std::string source_type_tag(SourceType type) {
+	switch (type) {
+	case DEVICE_CAPTURE: return "mic";
+	case DEVICE_LOOPBACK: return "loopback";
+	case APP_LOOPBACK: return "app";
+	}
+	return "mic";
+}
+
+static bool source_type_from_tag(const std::string& tag, SourceType& type) {
+	if (tag == "mic") type = DEVICE_CAPTURE;
+	else if (tag == "loopback") type = DEVICE_LOOPBACK;
+	else if (tag == "app") type = APP_LOOPBACK;
+	else return false;
+	return true;
+}
+
+static std::wstring narrow_to_wide(const std::string& text) {
+	std::wstring result;
+	CStringUtils::UnicodeConvert(text, result);
+	return result;
+}
+
+static std::string wide_to_narrow(const std::wstring& text) {
+	std::string result;
+	CStringUtils::UnicodeConvert(text, result);
+	return result;
+}
+
+// Stored value layout: type \t custom name \t device name (or exe) \t window
+// title. Tab-separated because the GUI input boxes cannot produce a tab.
+static std::string encode_configured_source(const ConfiguredSource& source) {
+	std::string device_or_exe;
+	std::string window_title;
+	if (source.type == APP_LOOPBACK) {
+		device_or_exe = wide_to_narrow(source.app.name);
+		window_title = wide_to_narrow(source.app.window_title);
+	}
+	else {
+		device_or_exe = wide_to_narrow(source.device.name);
+	}
+	return source_type_tag(source.type) + "\t" + wide_to_narrow(source.custom_name) +
+		"\t" + device_or_exe + "\t" + window_title + "\t" + (source.enabled ? "1" : "0");
+}
+
+static bool decode_configured_source(const std::string& value, ConfiguredSource& source) {
+	std::vector<std::string> fields;
+	size_t start = 0;
+	while (true) {
+		size_t pos = value.find('\t', start);
+		if (pos == std::string::npos) {
+			fields.push_back(value.substr(start));
+			break;
+		}
+		fields.push_back(value.substr(start, pos - start));
+		start = pos + 1;
+	}
+	if (fields.size() < 3) return false;
+
+	ConfiguredSource decoded{};
+	if (!source_type_from_tag(fields[0], decoded.type)) return false;
+	decoded.custom_name = narrow_to_wide(fields[1]);
+	if (decoded.type == APP_LOOPBACK) {
+		decoded.app.name = narrow_to_wide(fields[2]);
+		decoded.app.id = 0;
+		if (fields.size() > 3) decoded.app.window_title = narrow_to_wide(fields[3]);
+	}
+	else {
+		decoded.device.name = narrow_to_wide(fields[2]);
+	}
+	// fp.ini files written by older builds have no fifth field: such sources
+	// are enabled, which is how they behaved before the flag existed.
+	decoded.enabled = !(fields.size() > 4 && fields[4] == "0");
+	source = decoded;
+	return true;
+}
+
+static void save_configured_sources() {
+	conf.clear_section("Sources");
+	conf.write("Sources", "count", std::to_string(g_ConfiguredSources.size()));
+	for (size_t i = 0; i < g_ConfiguredSources.size(); ++i) {
+		conf.write("Sources", "source-" + std::to_string(i + 1), encode_configured_source(g_ConfiguredSources[i]));
+	}
+	conf.save();
+}
+
+static void load_configured_sources() {
+	g_ConfiguredSources.clear();
+	unsigned int count = 0;
+	try {
+		count = static_cast<unsigned int>(std::stoul(conf.read("Sources", "count")));
+	}
+	catch (const std::exception&) {
+		count = 0;
+	}
+	for (unsigned int i = 0; i < count; ++i) {
+		ConfiguredSource source{};
+		if (decode_configured_source(conf.read("Sources", "source-" + std::to_string(i + 1)), source)) {
+			g_ConfiguredSources.push_back(source);
+		}
+	}
+}
+
+static std::wstring quote_text(const std::wstring& text) {
+	return ui_language::is_russian() ? (L"«" + text + L"»") : (L"\"" + text + L"\"");
+}
+
+// One-line, screen-reader friendly description of what a source records.
+static std::wstring describe_configured_source(const ConfiguredSource& source) {
+	switch (source.type) {
+	case DEVICE_CAPTURE:
+		return trs(L"microphone ", L"микрофон ") + quote_text(source.device.name);
+	case DEVICE_LOOPBACK:
+		return trs(L"system sound ", L"системный звук ") + quote_text(source.device.name);
+	case APP_LOOPBACK: {
+		std::wstring title = source.app.window_title.empty() ? source.app.name : source.app.window_title;
+		std::wstring text = trs(L"application ", L"приложение ") + quote_text(title);
+		if (!source.app.window_title.empty() && !source.app.name.empty()) {
+			text += L" (" + source.app.name + L")";
+		}
+		return text;
+	}
+	}
+	return L"";
+}
 
 static inline std::string _cdecl get_now(bool filename = true) {
 	auto now = std::chrono::system_clock::now();
@@ -381,7 +528,7 @@ static int ExecSystemCmd(const std::string& str, std::string& out)
 		wait(5);
 		DWORD ret = WaitForSingleObject(pi.hProcess, 50);
 		if (gui::try_close) {
-			int result = alert(L"FPWarning", L"You are attempting to close the program while it is converting a recording to another format. If the recording is lengthy, please wait a bit longer. If you believe the program has frozen and will not complete the conversion, click \"Yes\".", MB_YESNO | MB_ICONEXCLAMATION);
+			int result = alert(tr(L"FPWarning", L"Предупреждение"), tr(L"You are attempting to close the program while it is converting a recording to another format. If the recording is lengthy, please wait a bit longer. If you believe the program has frozen and will not complete the conversion, click \"Yes\".", L"Программа закрывается во время конвертации записи в другой формат. Если запись длинная, подождите ещё немного. Если кажется, что программа зависла и конвертация не завершится, нажмите «Да»."), MB_YESNO | MB_ICONEXCLAMATION);
 			if (result == IDYES) {
 				g_Retcode = 0;
 				g_Running = false;
@@ -443,6 +590,338 @@ static std::vector<std::wstring> WINAPI get_files(std::wstring path) {
 	}
 
 	return files;
+}
+
+
+
+// --- FFmpeg: search, automatic download and installation next to the program ---
+
+static const wchar_t* kFFmpegDownloadURL = L"https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
+
+static const std::filesystem::path& ProgramDir() {
+	static const std::filesystem::path dir = [] {
+		std::wstring buf(32768, L'\0');
+		const DWORD n = GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
+		if (n == 0 || n >= buf.size()) return std::filesystem::path(L".");
+		buf.resize(n);
+		return std::filesystem::path(buf).parent_path();
+	}();
+	return dir;
+}
+
+static bool FileExistsW(const std::filesystem::path& p) {
+	const DWORD attrs = GetFileAttributesW(p.c_str());
+	return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+// ffmpeg.exe next to the program wins; otherwise the copy from PATH. Empty when missing.
+static std::wstring ResolveFFmpeg() {
+	const std::filesystem::path local = ProgramDir() / L"ffmpeg.exe";
+	if (FileExistsW(local)) return local.wstring();
+
+	std::wstring buf(32768, L'\0');
+	const DWORD n = SearchPathW(nullptr, L"ffmpeg.exe", nullptr, static_cast<DWORD>(buf.size()), buf.data(), nullptr);
+	if (n == 0 || n >= buf.size()) return L"";
+	buf.resize(n);
+	return buf;
+}
+
+static bool IsLocalFFmpeg(const std::wstring& path) {
+	if (path.empty()) return false;
+	std::error_code ec1, ec2;
+	const auto a = std::filesystem::weakly_canonical(std::filesystem::path(path), ec1);
+	const auto b = std::filesystem::weakly_canonical(ProgramDir() / L"ffmpeg.exe", ec2);
+	if (ec1 || ec2) return false;
+	return _wcsicmp(a.c_str(), b.c_str()) == 0;
+}
+
+static std::string WideToUtf8(const std::wstring& s) {
+	std::string out;
+	CStringUtils::UnicodeConvert(s, out);
+	return out;
+}
+
+static std::wstring FFmpegStatusText() {
+	const std::wstring p = ResolveFFmpeg();
+	if (p.empty()) return tr(L"FFmpeg: not found", L"FFmpeg: не найден");
+	if (IsLocalFFmpeg(p)) return tr(L"FFmpeg: installed next to the program", L"FFmpeg: установлен рядом с программой");
+	return tr(L"FFmpeg: found in PATH", L"FFmpeg: найден в PATH");
+}
+
+// Quoted, because the program may live in a folder whose path contains spaces.
+static std::string FFmpegProbeCommand() {
+	const std::wstring p = ResolveFFmpeg();
+	if (p.empty()) return "ffmpeg.exe -h";
+	return "\"" + WideToUtf8(p) + "\" -h";
+}
+
+// Preset commands are stored as "ffmpeg.exe ...": point the leading executable at the resolved copy.
+static std::string ApplyFFmpegPath(std::string cmd) {
+	static const std::string token = "ffmpeg.exe";
+	if (cmd.size() < token.size()) return cmd;
+	std::string head = cmd.substr(0, token.size());
+	for (char& c : head) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+	if (head != token) return cmd;
+	if (cmd.size() > token.size() && cmd[token.size()] != ' ') return cmd;
+	const std::wstring p = ResolveFFmpeg();
+	if (p.empty()) return cmd;
+	return "\"" + WideToUtf8(p) + "\"" + cmd.substr(token.size());
+}
+
+struct CFFmpegInstallUI {
+	HWND hwnd = nullptr;
+	HWND status = nullptr;
+	HWND progress = nullptr;
+	HWND cancel = nullptr;
+	bool cancelled = false;
+	int last_percent = -1;
+};
+
+static CFFmpegInstallUI g_FFmpegInstallUI;
+
+static LRESULT CALLBACK FFmpegInstallWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+	switch (msg) {
+	case WM_COMMAND:
+		if (LOWORD(wParam) == 1) { g_FFmpegInstallUI.cancelled = true; return 0; }
+		break;
+	case WM_CLOSE:
+		g_FFmpegInstallUI.cancelled = true;
+		return 0;
+	}
+	return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void DestroyFFmpegInstallUI() {
+	if (g_FFmpegInstallUI.hwnd) DestroyWindow(g_FFmpegInstallUI.hwnd);
+	g_FFmpegInstallUI = CFFmpegInstallUI{};
+}
+
+static void SetFFmpegInstallStatus(const std::wstring& text) {
+	if (g_FFmpegInstallUI.status) SetWindowTextW(g_FFmpegInstallUI.status, text.c_str());
+}
+
+static void PumpInstallMessages() {
+	MSG msg;
+	while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+		if (msg.message == WM_QUIT) { PostQuitMessage(static_cast<int>(msg.wParam)); continue; }
+		TranslateMessage(&msg);
+		DispatchMessageW(&msg);
+	}
+	if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) g_FFmpegInstallUI.cancelled = true;
+}
+
+static bool CreateFFmpegInstallUI(const std::wstring& status_text) {
+	static bool class_registered = false;
+	HINSTANCE inst = GetModuleHandleW(nullptr);
+	if (!class_registered) {
+		WNDCLASSEXW wc = { 0 };
+		wc.cbSize = sizeof(wc);
+		wc.lpfnWndProc = FFmpegInstallWndProc;
+		wc.hInstance = inst;
+		wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+		wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+		wc.lpszClassName = L"FPRecorderFFmpegInstall";
+		if (!RegisterClassExW(&wc)) return false;
+		class_registered = true;
+	}
+	INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_PROGRESS_CLASS };
+	InitCommonControlsEx(&icc);
+
+	HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME, L"FPRecorderFFmpegInstall",
+		tr(L"Installing FFmpeg", L"Установка FFmpeg"),
+		WS_VISIBLE | WS_CAPTION | WS_SYSMENU | WS_OVERLAPPED, CW_USEDEFAULT, CW_USEDEFAULT,
+		500, 160, nullptr, nullptr, inst, nullptr);
+	if (!hwnd) return false;
+	g_FFmpegInstallUI.hwnd = hwnd;
+	g_FFmpegInstallUI.status = CreateWindowExW(0, L"STATIC", status_text.c_str(),
+		WS_VISIBLE | WS_CHILD, 15, 12, 460, 40, hwnd, nullptr, inst, nullptr);
+	g_FFmpegInstallUI.progress = CreateWindowExW(0, PROGRESS_CLASSW, nullptr,
+		WS_VISIBLE | WS_CHILD, 15, 55, 460, 22, hwnd, nullptr, inst, nullptr);
+	SendMessageW(g_FFmpegInstallUI.progress, PBM_SETRANGE32, 0, 1000);
+	g_FFmpegInstallUI.cancel = CreateWindowExW(0, L"BUTTON", tr(L"Cancel", L"Отмена"),
+		WS_VISIBLE | WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON, 375, 85, 100, 28, hwnd,
+		reinterpret_cast<HMENU>(static_cast<INT_PTR>(1)), inst, nullptr);
+	UpdateWindow(hwnd);
+	SetForegroundWindow(hwnd);
+	SetFocus(g_FFmpegInstallUI.cancel);
+	return true;
+}
+
+class CFFmpegDownloadCallback final : public IBindStatusCallback {
+public:
+	CFFmpegDownloadCallback() : m_refs(1) {}
+
+	HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+		if (!ppv) return E_INVALIDARG;
+		if (riid == IID_IUnknown || riid == IID_IBindStatusCallback) {
+			*ppv = static_cast<IBindStatusCallback*>(this);
+			AddRef();
+			return S_OK;
+		}
+		*ppv = nullptr;
+		return E_NOINTERFACE;
+	}
+	ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&m_refs)); }
+	ULONG STDMETHODCALLTYPE Release() override {
+		const LONG refs = InterlockedDecrement(&m_refs);
+		if (refs == 0) delete this;
+		return static_cast<ULONG>(refs);
+	}
+
+	HRESULT STDMETHODCALLTYPE OnProgress(ULONG progress, ULONG max, ULONG, LPCWSTR) override {
+		if (max > 0 && g_FFmpegInstallUI.progress) {
+			const int permille = static_cast<int>((static_cast<unsigned long long>(progress) * 1000) / max);
+			SendMessageW(g_FFmpegInstallUI.progress, PBM_SETPOS, permille, 0);
+			const int percent = permille / 10;
+			if (percent != g_FFmpegInstallUI.last_percent) {
+				g_FFmpegInstallUI.last_percent = percent;
+				SetFFmpegInstallStatus(trs(L"Downloading FFmpeg: ", L"Загрузка FFmpeg: ") + std::to_wstring(percent) + trs(L" %  (about 115 MB)", L" %  (около 115 МБ)"));
+				if (g_FFmpegInstallUI.hwnd) {
+					SetWindowTextW(g_FFmpegInstallUI.hwnd, (trs(L"Installing FFmpeg — ", L"Установка FFmpeg — ") + std::to_wstring(percent) + L"%").c_str());
+				}
+			}
+		}
+		PumpInstallMessages();
+		if (g_FFmpegInstallUI.cancelled || !g_Running) return E_ABORT;
+		return S_OK;
+	}
+
+	HRESULT STDMETHODCALLTYPE OnStartBinding(DWORD, IBinding*) override { return S_OK; }
+	HRESULT STDMETHODCALLTYPE GetPriority(LONG* priority) override { if (priority) *priority = THREAD_PRIORITY_NORMAL; return S_OK; }
+	HRESULT STDMETHODCALLTYPE OnLowResource(DWORD) override { return S_OK; }
+	HRESULT STDMETHODCALLTYPE OnStopBinding(HRESULT, LPCWSTR) override { return S_OK; }
+	HRESULT STDMETHODCALLTYPE GetBindInfo(DWORD* flags, BINDINFO* info) override {
+		if (flags) *flags = 0;
+		if (info) { memset(info, 0, sizeof(*info)); info->cbSize = sizeof(*info); }
+		return S_OK;
+	}
+	HRESULT STDMETHODCALLTYPE OnDataAvailable(DWORD, DWORD, FORMATETC*, STGMEDIUM*) override { return S_OK; }
+	HRESULT STDMETHODCALLTYPE OnObjectAvailable(REFIID, IUnknown*) override { return S_OK; }
+
+private:
+	LONG m_refs;
+};
+
+static bool FindFFmpegExeRecursive(const std::filesystem::path& dir, std::filesystem::path& found) {
+	std::error_code ec;
+	for (auto it = std::filesystem::recursive_directory_iterator(dir, std::filesystem::directory_options::skip_permission_denied, ec);
+		!ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+		std::error_code file_ec;
+		if (!it->is_regular_file(file_ec)) continue;
+		if (_wcsicmp(it->path().filename().c_str(), L"ffmpeg.exe") == 0) {
+			found = it->path();
+			return true;
+		}
+	}
+	return false;
+}
+
+// Downloads the essentials build and puts ffmpeg.exe next to the program.
+static bool InstallFFmpeg(std::wstring& error) {
+	error.clear();
+	g_FFmpegInstallUI = CFFmpegInstallUI{};
+	if (!CreateFFmpegInstallUI(tr(L"Downloading FFmpeg from the internet...", L"Загрузка FFmpeg из интернета..."))) {
+		error = tr(L"Could not open the download window.", L"Не удалось открыть окно загрузки.");
+		return false;
+	}
+
+	wchar_t temp_path[MAX_PATH] = { 0 };
+	if (GetTempPathW(MAX_PATH, temp_path) == 0) wcscpy_s(temp_path, L".\\");
+	const std::filesystem::path work_dir = std::filesystem::path(temp_path) / L"FPRecorder-FFmpeg";
+	const std::filesystem::path zip_path = work_dir / L"ffmpeg.zip";
+	std::error_code ec;
+	std::filesystem::remove_all(work_dir, ec);
+	std::filesystem::create_directories(work_dir, ec);
+	if (ec) {
+		DestroyFFmpegInstallUI();
+		error = trs(L"Could not create a temporary folder: ", L"Не удалось создать временную папку: ") + work_dir.wstring();
+		return false;
+	}
+
+	const HRESULT hr_init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+	CFFmpegDownloadCallback* callback = new CFFmpegDownloadCallback();
+	const HRESULT hr = URLDownloadToFileW(nullptr, kFFmpegDownloadURL, zip_path.c_str(), 0, callback);
+	callback->Release();
+	if (SUCCEEDED(hr_init)) CoUninitialize();
+
+	if (g_FFmpegInstallUI.cancelled) {
+		DestroyFFmpegInstallUI();
+		std::filesystem::remove_all(work_dir, ec);
+		error = tr(L"Download cancelled.", L"Загрузка отменена.");
+		return false;
+	}
+	if (FAILED(hr) || !FileExistsW(zip_path)) {
+		DestroyFFmpegInstallUI();
+		std::filesystem::remove_all(work_dir, ec);
+		error = trs(L"Download failed. Check the internet connection and try again. Error code: ", L"Загрузка не удалась. Проверьте подключение к интернету и повторите попытку. Код ошибки: ") + std::to_wstring(static_cast<long>(hr));
+		return false;
+	}
+
+	SetFFmpegInstallStatus(tr(L"Unpacking FFmpeg...", L"Распаковка FFmpeg..."));
+	SendMessageW(g_FFmpegInstallUI.progress, PBM_SETPOS, 1000, 0);
+
+	std::string output;
+	std::string tar_cmd = "tar.exe -xf \"" + WideToUtf8(zip_path.wstring()) + "\" -C \"" + WideToUtf8(work_dir.wstring()) + "\"";
+	int result = ExecSystemCmd(tar_cmd, output);
+	std::filesystem::path extracted;
+	if (result != 0 || !FindFFmpegExeRecursive(work_dir, extracted)) {
+		// tar.exe ships with Windows 10 1803+; PowerShell covers older systems.
+		std::string ps_cmd = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"Expand-Archive -LiteralPath '" +
+			WideToUtf8(zip_path.wstring()) + "' -DestinationPath '" + WideToUtf8(work_dir.wstring()) + "' -Force\"";
+		output.clear();
+		result = ExecSystemCmd(ps_cmd, output);
+		extracted.clear();
+		if (result != 0 || !FindFFmpegExeRecursive(work_dir, extracted)) {
+			DestroyFFmpegInstallUI();
+			std::filesystem::remove_all(work_dir, ec);
+			error = tr(L"Could not unpack the downloaded archive.", L"Не удалось распаковать скачанный архив.");
+			return false;
+		}
+	}
+
+	SetFFmpegInstallStatus(tr(L"Installing FFmpeg next to the program...", L"Установка FFmpeg рядом с программой..."));
+	const std::filesystem::path target = ProgramDir() / L"ffmpeg.exe";
+	ec.clear();
+	std::filesystem::copy_file(extracted, target, std::filesystem::copy_options::overwrite_existing, ec);
+	if (ec || !FileExistsW(target)) {
+		DestroyFFmpegInstallUI();
+		std::filesystem::remove_all(work_dir, ec);
+		error = trs(L"Could not copy ffmpeg.exe next to the program. If the program is in a protected folder, run it as administrator. Path: ", L"Не удалось скопировать ffmpeg.exe рядом с программой. Если программа лежит в защищённой папке, запустите её от имени администратора. Путь: ") + ProgramDir().wstring();
+		return false;
+	}
+
+	std::filesystem::remove_all(work_dir, ec);
+	DestroyFFmpegInstallUI();
+
+	std::string probe_output;
+	if (ExecSystemCmd(FFmpegProbeCommand(), probe_output) != 0) {
+		error = tr(L"FFmpeg was downloaded but does not start.", L"FFmpeg скачан, но не запускается.");
+		return false;
+	}
+	return true;
+}
+
+// Returns true when a working FFmpeg is available. Offers to install it when missing.
+static bool EnsureFFmpegAvailable() {
+	if (!ResolveFFmpeg().empty()) {
+		std::string probe_output;
+		if (ExecSystemCmd(FFmpegProbeCommand(), probe_output) == 0) return true;
+	}
+	const int answer = alert(tr(L"FFmpeg required", L"Нужен FFmpeg"),
+		tr(L"FFmpeg is not installed: it was not found next to the program or in PATH. It is required for presets and audio formats other than WAV.\n\nDownload and install FFmpeg automatically next to the program? The download is about 115 MB and needs an internet connection.",
+			L"FFmpeg не установлен: его нет ни рядом с программой, ни в PATH. Он нужен для пресетов и форматов аудио, кроме WAV.\n\nСкачать и установить FFmpeg автоматически рядом с программой? Размер загрузки около 115 МБ, потребуется интернет."),
+		MB_YESNO | MB_ICONQUESTION);
+	if (answer != IDYES) return false;
+
+	std::wstring error;
+	if (!InstallFFmpeg(error)) {
+		alert(tr(L"FFmpeg not installed", L"FFmpeg не установлен"), error, MB_ICONERROR);
+		return false;
+	}
+	alert(tr(L"FFmpeg installed", L"FFmpeg установлен"),
+		trs(L"FFmpeg is installed next to the program: ", L"FFmpeg установлен рядом с программой: ") + (ProgramDir() / L"ffmpeg.exe").wstring(),
+		MB_ICONINFORMATION);
+	return true;
 }
 
 
@@ -553,7 +1032,7 @@ static void CheckIfError(const ma_result& result) {
 	ss << ma_result_to_string(result).data() << std::endl;
 	ss << st;
 	CStringUtils::UnicodeConvert(ss.str(), error_u);
-	alert(L"FPRuntimeError", error_u, MB_ICONERROR);
+	alert(tr(L"FPRuntimeError", L"Критическая ошибка"), error_u, MB_ICONERROR);
 	g_Retcode = result;
 	g_Running = false;
 }
@@ -1444,6 +1923,142 @@ std::vector<audio_device> MA_API get_output_audio_devices()
 
 
 
+// Enumerate visible top-level windows: one entry per process that has a
+// titled window. This is the list a person can actually recognise
+// ("YouTube — Google Chrome"), unlike the raw process dump.
+struct app_enumeration {
+	std::vector<application>* apps;
+	const std::unordered_map<ma_uint32, std::wstring>* process_names;
+};
+
+static BOOL CALLBACK collect_app_window(HWND hwnd, LPARAM lparam) {
+	app_enumeration* enumeration = reinterpret_cast<app_enumeration*>(lparam);
+
+	if (!IsWindowVisible(hwnd)) return TRUE;
+	if (GetWindow(hwnd, GW_OWNER) != nullptr) return TRUE;
+	if (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return TRUE;
+
+	int title_length = GetWindowTextLengthW(hwnd);
+	if (title_length <= 0) return TRUE;
+
+	DWORD process_id = 0;
+	GetWindowThreadProcessId(hwnd, &process_id);
+	if (process_id == 0 || process_id == GetCurrentProcessId()) return TRUE;
+	for (const auto& existing : *enumeration->apps) {
+		if (existing.id == process_id) return TRUE;
+	}
+
+	auto process_name = enumeration->process_names->find(static_cast<ma_uint32>(process_id));
+	if (process_name == enumeration->process_names->end()) return TRUE;
+
+	std::vector<wchar_t> title(title_length + 1, L'\0');
+	GetWindowTextW(hwnd, title.data(), title_length + 1);
+
+	application app;
+	app.name = process_name->second;
+	app.window_title = title.data();
+	app.id = process_id;
+	enumeration->apps->push_back(app);
+	return TRUE;
+}
+
+static std::vector<application> get_window_application_list() {
+	std::unordered_map<ma_uint32, std::wstring> process_names;
+	for (const auto& process : get_tasklist()) {
+		process_names[process.id] = process.name;
+	}
+
+	std::vector<application> apps;
+	app_enumeration enumeration{ &apps, &process_names };
+	EnumWindows(collect_app_window, reinterpret_cast<LPARAM>(&enumeration));
+	std::sort(apps.begin(), apps.end(), [](const application& left, const application& right) {
+		int result = lstrcmpiW(left.window_title.c_str(), right.window_title.c_str());
+		if (result != 0) return result < 0;
+		return lstrcmpiW(left.name.c_str(), right.name.c_str()) < 0;
+	});
+	return apps;
+}
+
+// Device ids and process ids do not survive a restart, so every configured
+// source is matched to a live target again right before recording starts.
+static std::vector<std::wstring> resolve_sources_for_capture(std::vector<ConfiguredSource>& resolved_sources) {
+	resolved_sources.clear();
+	std::vector<std::wstring> missing;
+
+	std::vector<audio_device> input_devices = get_input_audio_devices();
+	std::vector<audio_device> output_devices = get_output_audio_devices();
+	std::vector<application> window_apps = get_window_application_list();
+	std::vector<application> tasklist;
+	bool tasklist_ready = false;
+
+	for (const ConfiguredSource& source : g_ConfiguredSources) {
+		// Sources switched off in the main window stay in the list but take no
+		// part in this recording.
+		if (!source.enabled) continue;
+
+		ConfiguredSource target = source;
+		bool found = false;
+
+		if (source.type == DEVICE_CAPTURE) {
+			for (const auto& device : input_devices) {
+				if (device.name == source.device.name) { target.device = device; found = true; break; }
+			}
+		}
+		else if (source.type == DEVICE_LOOPBACK) {
+			for (const auto& device : output_devices) {
+				if (device.name == source.device.name) { target.device = device; found = true; break; }
+			}
+		}
+		else {
+			for (const auto& app : window_apps) {
+				if (lstrcmpiW(app.name.c_str(), source.app.name.c_str()) != 0) continue;
+				if (source.app.window_title.empty() || app.window_title == source.app.window_title) {
+					target.app = app;
+					found = true;
+					break;
+				}
+			}
+			if (!found) {
+				for (const auto& app : window_apps) {
+					if (lstrcmpiW(app.name.c_str(), source.app.name.c_str()) == 0) { target.app = app; found = true; break; }
+				}
+			}
+			if (!found) {
+				if (!tasklist_ready) { tasklist = get_tasklist(); tasklist_ready = true; }
+				for (const auto& app : tasklist) {
+					if (lstrcmpiW(app.name.c_str(), source.app.name.c_str()) == 0) { target.app = app; found = true; break; }
+				}
+			}
+		}
+
+		if (found) resolved_sources.push_back(target);
+		else missing.push_back(source.custom_name);
+	}
+	return missing;
+}
+
+static bool prepare_sources_for_recording(std::vector<ConfiguredSource>& resolved_sources) {
+	std::vector<std::wstring> missing = resolve_sources_for_capture(resolved_sources);
+
+	if (resolved_sources.empty()) {
+		alert(tr(L"FPError", L"Ошибка"),
+			tr(L"None of the configured sources is available right now, so recording cannot start. Check the devices and applications, then try again.",
+				L"Ни один из настроенных источников сейчас недоступен, поэтому запись не начнётся. Проверьте устройства и приложения и попробуйте снова."),
+			MB_ICONWARNING);
+		return false;
+	}
+	if (!missing.empty()) {
+		std::wstring text = tr(L"These sources are not available right now and will be skipped:\n",
+			L"Эти источники сейчас недоступны и будут пропущены:\n");
+		for (size_t i = 0; i < missing.size(); ++i) {
+			if (i > 0) text += L"\n";
+			text += L"— " + missing[i];
+		}
+		alert(tr(L"Source unavailable", L"Источник недоступен"), text, MB_ICONWARNING);
+	}
+	return true;
+}
+
 class IWindow;
 
 static std::vector<IWindow*> g_Windows;
@@ -1498,7 +2113,7 @@ static void window_reset() {
 	g_Windows.clear();
 }
 
-static const std::wstring version = L"0.0.1 Beta";
+static const std::wstring version = L"0.4.0";
 
 
 static std::vector<audio_device> g_InAudioDevices;
@@ -1536,6 +2151,7 @@ public:
 	HWND sources_list = nullptr;
 	HWND add_source_btn = nullptr;
 	HWND remove_source_btn = nullptr;
+	HWND toggle_source_btn = nullptr;
 	HWND record_manager = nullptr;
 	HWND settings_button = nullptr;
 
@@ -1543,42 +2159,67 @@ public:
 		this->reset();
 		std::wstring wsHkStartStop; CStringUtils::UnicodeConvert(hotkey_start_stop, wsHkStartStop);
 
-		record_start = create_button(window, std::wstring(L"Start recording (" + wsHkStartStop + L")").c_str(), 10, 10, 200, 50, 0);
+		record_start = create_button(window, (trs(L"Start recording ", L"Начать запись ") + L"(" + wsHkStartStop + L")").c_str(), 10, 10, 200, 50, 0);
 		push(record_start);
 
-		sources_list_text = create_text(window, L"Recording Sources:", 10, 70, 200, 20, 0);
+		sources_list_text = create_text(window, tr(L"Recording Sources:", L"Источники записи:"), 10, 70, 200, 20, 0);
 		push(sources_list_text);
 
-		sources_list = create_list(window, 10, 90, 300, 150, 0);
+		sources_list = create_list(window, 10, 90, 400, 150, 0);
 		push(sources_list);
 		update_sources_list();
 
-		add_source_btn = create_button(window, L"Add Source...", 10, 250, 145, 30, 0);
+		add_source_btn = create_button(window, tr(L"Add Source...", L"Добавить источник..."), 10, 250, 145, 30, 0);
 		push(add_source_btn);
-		remove_source_btn = create_button(window, L"Remove Selected", 165, 250, 145, 30, 0);
+		remove_source_btn = create_button(window, tr(L"Remove Selected", L"Удалить выбранный"), 165, 250, 145, 30, 0);
 		push(remove_source_btn);
+		toggle_source_btn = create_button(window, tr(L"On / off (Space)", L"Вкл/выкл (пробел)"), 320, 250, 175, 30, 0);
+		push(toggle_source_btn);
 
-		record_manager = create_button(window, L"Recordings manager", 10, 450, 200, 50, 0);
+		record_manager = create_button(window, tr(L"Recordings manager", L"Менеджер записей"), 10, 450, 200, 50, 0);
 		push(record_manager);
-		settings_button = create_button(window, L"Settings", 10, 450 + 50 + 10, 200, 50, 0);
+		settings_button = create_button(window, tr(L"Settings", L"Настройки"), 10, 450 + 50 + 10, 200, 50, 0);
 		push(settings_button);
 
 		focus(record_start);
 	}
 
-	void update_sources_list() {
+	void update_sources_list(int announce_index = -1) {
 		if (!sources_list) return;
+		// Rebuilding the items drops the selection, so remember it and put it back:
+		// the user toggles the very row they are standing on.
+		int selection = get_list_position(sources_list);
 		clear_list(sources_list);
-		for (const auto& source : g_ConfiguredSources) {
-			std::wstring type_str;
-			switch (source.type) {
-			case DEVICE_CAPTURE: type_str = L"[Mic]"; break;
-			case DEVICE_LOOPBACK: type_str = L"[Loopback]"; break;
-			case APP_LOOPBACK: type_str = L"[App]"; break;
-			}
-			std::wstring display_text = source.custom_name + L" " + type_str;
+		for (size_t i = 0; i < g_ConfiguredSources.size(); ++i) {
+			const ConfiguredSource& source = g_ConfiguredSources[i];
+			std::wstring display_text = std::to_wstring(i + 1) + L". " + source.custom_name +
+				L" — " + (source.enabled ? trs(L"on", L"включён") : trs(L"off", L"выключен")) +
+				L" (" + describe_configured_source(source) + L")";
 			add_list_item(sources_list, display_text.c_str());
 		}
+		if (selection >= 0 && static_cast<size_t>(selection) < g_ConfiguredSources.size()) {
+			set_list_position(sources_list, selection);
+		}
+		if (announce_index >= 0) {
+			// Screen readers learn about the new text through accessibility
+			// notifications: the item name changed, then it is re-announced as
+			// selected. Child ids in a list box are 1-based.
+			NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, sources_list, OBJID_CLIENT, announce_index + 1);
+			NotifyWinEvent(EVENT_OBJECT_SELECTION, sources_list, OBJID_CLIENT, announce_index + 1);
+		}
+	}
+
+	void toggle_selected_source() {
+		if (!sources_list) return;
+		int selection = get_list_position(sources_list);
+		if (selection < 0 || static_cast<size_t>(selection) >= g_ConfiguredSources.size()) {
+			alert(tr(L"Input Error", L"Ошибка ввода"), tr(L"Please select a source in the list first.", L"Сначала выберите источник в списке."), MB_ICONWARNING);
+			focus(sources_list);
+			return;
+		}
+		g_ConfiguredSources[selection].enabled = !g_ConfiguredSources[selection].enabled;
+		save_configured_sources();
+		update_sources_list(selection);
 	}
 };
 
@@ -1595,19 +2236,19 @@ public:
 
 	void build()override {
 		wait(50);
-		items_view_text = create_text(window, L"Items view", 10, 10, 0, 10, 0);
+		items_view_text = create_text(window, tr(L"Items view", L"Записи"), 10, 10, 0, 10, 0);
 		push(items_view_text);
 		items_view_list = create_list(window, 10, 10, 0, 10, 0);
 		push(items_view_list);
-		play_button = create_button(window, L"Play", 10, 10, 10, 10, 0);
+		play_button = create_button(window, tr(L"Play", L"Воспроизвести"), 10, 10, 10, 10, 0);
 		push(play_button);
-		pause_button = create_button(window, L"&Pause", 10, 10, 10, 10, 0);
+		pause_button = create_button(window, tr(L"&Pause", L"&Пауза"), 10, 10, 10, 10, 0);
 		push(pause_button);
-		stop_button = create_button(window, L"Stop", 10, 10, 10, 10, 0);
+		stop_button = create_button(window, tr(L"Stop", L"Стоп"), 10, 10, 10, 10, 0);
 		push(stop_button);
-		delete_button = create_button(window, L"Delete", 10, 10, 10, 10, 0);
+		delete_button = create_button(window, tr(L"Delete", L"Удалить"), 10, 10, 10, 10, 0);
 		push(delete_button);
-		close_button = create_button(window, L"Close", 10, 10, 10, 10, 0);
+		close_button = create_button(window, tr(L"Close", L"Закрыть"), 10, 10, 10, 10, 0);
 		push(close_button);
 		std::vector<std::wstring> files = get_files(record_path.generic_wstring());
 		for (unsigned int i = 0; i < files.size(); i++) {
@@ -1636,13 +2277,13 @@ public:
 		std::wstring wsHkRestart; CStringUtils::UnicodeConvert(hotkey_restart, wsHkRestart);
 		std::wstring wsHkHideShow; CStringUtils::UnicodeConvert(hotkey_hide_show, wsHkHideShow);
 
-		record_stop = create_button(window, std::wstring(L"Stop recording (" + wsHkStartStop + L")").c_str(), 10, 10, 100, 30, 0);
+		record_stop = create_button(window, (trs(L"Stop recording ", L"Остановить запись ") + L"(" + wsHkStartStop + L")").c_str(), 10, 10, 160, 30, 0);
 		push(record_stop);
-		record_pause = create_button(window, std::wstring(L"Pause recording (" + wsHkPauseResume + L")").c_str(), 120, 10, 100, 30, 0);
+		record_pause = create_button(window, (trs(L"Pause recording ", L"Пауза записи ") + L"(" + wsHkPauseResume + L")").c_str(), 180, 10, 160, 30, 0);
 		push(record_pause);
-		record_restart = create_button(window, std::wstring(L"Restart recording (" + wsHkRestart + L")").c_str(), 230, 10, 100, 30, 0);
+		record_restart = create_button(window, (trs(L"Restart recording ", L"Перезапись ") + L"(" + wsHkRestart + L")").c_str(), 350, 10, 160, 30, 0);
 		push(record_restart);
-		hide = create_button(window, std::wstring(L"Hide window (" + wsHkHideShow + L")").c_str(), 250, 10, 100, 30, 0);
+		hide = create_button(window, (trs(L"Hide window ", L"Скрыть окно ") + L"(" + wsHkHideShow + L")").c_str(), 520, 10, 160, 30, 0);
 		push(hide);
 
 		focus(record_stop);
@@ -1677,6 +2318,11 @@ public:
 
 	HWND lblCurrentPreset, listCurrentPreset;
 
+	HWND lblLanguage, listLanguage;
+	std::string saved_language_setting;
+
+	HWND lblFFmpegStatus, btnDownloadFFmpeg;
+
 	HWND btnSaveSettings;
 	HWND btnCancelSettings;
 
@@ -1692,52 +2338,52 @@ public:
 		int ctrl_height = 25, list_height = 75, label_width = 140, control_width = 200;
 		int y_spacing = 5, section_spacing = 15;
 
-		push(create_text(window, L"Sample Rate (Hz):", x_label, y_pos, label_width, ctrl_height, 0));
+		push(create_text(window, tr(L"Sample Rate (Hz):", L"Частота дискретизации (Гц):"), x_label, y_pos, label_width, ctrl_height, 0));
 		editSampleRate = create_input_box(window, false, false, x_control, y_pos, control_width, ctrl_height, 0); push(editSampleRate);
 		set_text(editSampleRate, std::to_wstring(sample_rate).c_str());
 		y_pos += ctrl_height + y_spacing;
 
-		push(create_text(window, L"Channels:", x_label, y_pos, label_width, ctrl_height, 0));
+		push(create_text(window, tr(L"Channels:", L"Каналы:"), x_label, y_pos, label_width, ctrl_height, 0));
 		listChannels = create_list(window, x_control, y_pos, control_width, list_height, 0); push(listChannels);
-		add_list_item(listChannels, L"1 (Mono)");
-		add_list_item(listChannels, L"2 (Stereo)");
+		add_list_item(listChannels, tr(L"1 (Mono)", L"1 (моно)"));
+		add_list_item(listChannels, tr(L"2 (Stereo)", L"2 (стерео)"));
 		set_list_position(listChannels, channels == 1 ? 0 : 1);
 		y_pos += list_height + y_spacing;
 
-		push(create_text(window, L"Buffer Size (ms, 0=default):", x_label, y_pos, label_width, ctrl_height, 0));
+		push(create_text(window, tr(L"Buffer Size (ms, 0=default):", L"Размер буфера (мс, 0=по умолчанию):"), x_label, y_pos, label_width, ctrl_height, 0));
 		editBufferSize = create_input_box(window, false, false, x_control, y_pos, control_width, ctrl_height, 0); push(editBufferSize);
 		set_text(editBufferSize, std::to_wstring(buffer_size).c_str());
 		y_pos += ctrl_height + y_spacing;
 
-		push(create_text(window, L"Filename Signature:", x_label, y_pos, label_width, ctrl_height, 0));
+		push(create_text(window, tr(L"Filename Signature:", L"Подпись имени файла:"), x_label, y_pos, label_width, ctrl_height, 0));
 		std::wstring wsFilenameSig; CStringUtils::UnicodeConvert(filename_signature, wsFilenameSig);
 		editFilenameSignature = create_input_box(window, false, false, x_control, y_pos, control_width, ctrl_height, 0); push(editFilenameSignature);
 		set_text(editFilenameSignature, wsFilenameSig.c_str());
 		y_pos += ctrl_height + y_spacing;
 
-		push(create_text(window, L"Record Path:", x_label, y_pos, label_width, ctrl_height, 0));
+		push(create_text(window, tr(L"Record Path:", L"Папка записей:"), x_label, y_pos, label_width, ctrl_height, 0));
 		std::wstring wsRecordPath = record_path.generic_wstring();
 		editRecordPath = create_input_box(window, false, false, x_control, y_pos, control_width, ctrl_height, 0); push(editRecordPath);
 		set_text(editRecordPath, wsRecordPath.c_str());
-		btnBrowseRecordPath = create_button(window, L"Browse...", x_button_browse, y_pos, 30, ctrl_height, 0); push(btnBrowseRecordPath);
+		btnBrowseRecordPath = create_button(window, tr(L"Browse...", L"Обзор..."), x_button_browse, y_pos, 50, ctrl_height, 0); push(btnBrowseRecordPath);
 		y_pos += ctrl_height + y_spacing;
 
-		push(create_text(window, L"Audio Format:", x_label, y_pos, label_width, ctrl_height, 0));
+		push(create_text(window, tr(L"Audio Format:", L"Формат аудио:"), x_label, y_pos, label_width, ctrl_height, 0));
 		std::wstring wsAudioFormat; CStringUtils::UnicodeConvert(audio_format, wsAudioFormat);
 
 		editAudioFormat = create_input_box(window, false, false, x_control, y_pos, control_width, ctrl_height, 0); push(editAudioFormat);
 		set_text(editAudioFormat, wsAudioFormat.c_str());
 		y_pos += ctrl_height + y_spacing;
 
-		chkSoundEvents = create_checkbox(window, L"Enable Sound Events", x_label, y_pos, control_width + label_width, ctrl_height, 0); push(chkSoundEvents);
+		chkSoundEvents = create_checkbox(window, tr(L"Enable Sound Events", L"Звуковые события"), x_label, y_pos, control_width + label_width, ctrl_height, 0); push(chkSoundEvents);
 		set_checkboxMark(chkSoundEvents, sound_events == MA_TRUE ? true : false);
 		y_pos += ctrl_height + y_spacing;
 
-		chkMakeStems = create_checkbox(window, L"Make Stems (Mic/Loopback separate files, WAV only)", x_label, y_pos, control_width + label_width + 50, ctrl_height, 0); push(chkMakeStems);
+		chkMakeStems = create_checkbox(window, tr(L"Make Stems (Mic/Loopback separate files, WAV only)", L"Раздельные дорожки микрофон/системный звук (только WAV)"), x_label, y_pos, control_width + label_width + 50, ctrl_height, 0); push(chkMakeStems);
 		set_checkboxMark(chkMakeStems, make_stems == MA_TRUE ? true : false);
 		y_pos += ctrl_height + y_spacing;
 
-		push(create_text(window, L"Sample Format:", x_label, y_pos, label_width, ctrl_height, 0));
+		push(create_text(window, tr(L"Sample Format:", L"Формат сэмплов:"), x_label, y_pos, label_width, ctrl_height, 0));
 		listBufferFormat = create_list(window, x_control, y_pos, control_width, list_height + 20, 0); push(listBufferFormat);
 		constexpr const char* formats[] = { "u8", "s16", "s24", "s32", "f32" };
 		for (const char* fmt_str : formats) {
@@ -1752,25 +2398,25 @@ public:
 		y_pos += list_height + 20 + section_spacing;
 
 		// --- Hotkey Settings ---
-		push(create_text(window, L"Start/Stop Hotkey:", x_label, y_pos, label_width, ctrl_height, 0));
+		push(create_text(window, tr(L"Start/Stop Hotkey:", L"Клавиша старт/стоп:"), x_label, y_pos, label_width, ctrl_height, 0));
 		std::wstring wsHkStartStop; CStringUtils::UnicodeConvert(hotkey_start_stop, wsHkStartStop);
 		editHotkeyStartStop = create_input_box(window, false, false, x_control, y_pos, control_width, ctrl_height, 0); push(editHotkeyStartStop);
 		set_text(editHotkeyStartStop, wsHkStartStop.c_str());
 		y_pos += ctrl_height + y_spacing;
 
-		push(create_text(window, L"Pause/Resume Hotkey:", x_label, y_pos, label_width, ctrl_height, 0));
+		push(create_text(window, tr(L"Pause/Resume Hotkey:", L"Клавиша пауза/продолжить:"), x_label, y_pos, label_width, ctrl_height, 0));
 		std::wstring wsHkPauseResume; CStringUtils::UnicodeConvert(hotkey_pause_resume, wsHkPauseResume);
 		editHotkeyPauseResume = create_input_box(window, false, false, x_control, y_pos, control_width, ctrl_height, 0); push(editHotkeyPauseResume);
 		set_text(editHotkeyPauseResume, wsHkPauseResume.c_str());
 		y_pos += ctrl_height + y_spacing;
 
-		push(create_text(window, L"Restart Hotkey:", x_label, y_pos, label_width, ctrl_height, 0));
+		push(create_text(window, tr(L"Restart Hotkey:", L"Клавиша перезапись:"), x_label, y_pos, label_width, ctrl_height, 0));
 		std::wstring wsHkRestart; CStringUtils::UnicodeConvert(hotkey_restart, wsHkRestart);
 		editHotkeyRestart = create_input_box(window, false, false, x_control, y_pos, control_width, ctrl_height, 0); push(editHotkeyRestart);
 		set_text(editHotkeyRestart, wsHkRestart.c_str());
 		y_pos += ctrl_height + y_spacing;
 
-		push(create_text(window, L"Hide/Show Hotkey:", x_label, y_pos, label_width, ctrl_height, 0));
+		push(create_text(window, tr(L"Hide/Show Hotkey:", L"Клавиша скрыть/показать:"), x_label, y_pos, label_width, ctrl_height, 0));
 		std::wstring wsHkHideShow; CStringUtils::UnicodeConvert(hotkey_hide_show, wsHkHideShow);
 		editHotkeyHideShow = create_input_box(window, false, false, x_control, y_pos, control_width, ctrl_height, 0); push(editHotkeyHideShow);
 		set_text(editHotkeyHideShow, wsHkHideShow.c_str());
@@ -1778,7 +2424,7 @@ public:
 
 
 		// --- Preset Settings ---
-		push(create_text(window, L"Current FFmpeg Preset:", x_label, y_pos, label_width, ctrl_height, 0));
+		push(create_text(window, tr(L"Current FFmpeg Preset:", L"Пресет FFmpeg:"), x_label, y_pos, label_width, ctrl_height, 0));
 		listCurrentPreset = create_list(window, x_control, y_pos, control_width, list_height, 0); push(listCurrentPreset);
 		for (const auto& p : g_Presets) {
 			std::wstring wp_name; CStringUtils::UnicodeConvert(p.name, wp_name);
@@ -1789,11 +2435,23 @@ public:
 		y_pos += list_height + section_spacing;
 
 		// --- Action Buttons ---
-		btnSaveSettings = create_button(window, L"&Save and Apply", x_label, y_pos, 150, 30, 0); push(btnSaveSettings);
-		btnCancelSettings = create_button(window, L"&Cancel", x_control + 60, y_pos, 100, 30, 0); push(btnCancelSettings);
+		btnSaveSettings = create_button(window, tr(L"&Save and Apply", L"&Сохранить и применить"), x_label, y_pos, 150, 30, 0); push(btnSaveSettings);
+		btnCancelSettings = create_button(window, tr(L"&Cancel", L"&Отмена"), x_control + 60, y_pos, 100, 30, 0); push(btnCancelSettings);
 		y_pos += 30 + y_spacing;
 
+		// --- Interface language (top right, free area) ---
+		push(create_text(window, tr(L"Language:", L"Язык:"), 410, 10, 80, ctrl_height, 0));
+		listLanguage = create_list(window, 500, 10, 170, list_height, 0); push(listLanguage);
+		add_list_item(listLanguage, tr(L"System language", L"Системный язык"));
+		add_list_item(listLanguage, L"English");
+		add_list_item(listLanguage, L"Русский");
+		saved_language_setting = conf.read("General", "language");
+		if (saved_language_setting.empty()) saved_language_setting = "auto";
+		set_list_position(listLanguage, saved_language_setting == "en" ? 1 : (saved_language_setting == "ru" ? 2 : 0));
 
+		// --- FFmpeg (bottom right, free area) ---
+		lblFFmpegStatus = create_text(window, FFmpegStatusText().c_str(), 410, 95, 260, 40, 0); push(lblFFmpegStatus);
+		btnDownloadFFmpeg = create_button(window, tr(L"Download FFmpeg", L"Скачать FFmpeg"), 410, 140, 160, 30, 0); push(btnDownloadFFmpeg);
 
 		focus(editSampleRate);
 	}
@@ -1803,38 +2461,38 @@ public:
 		try {
 			const auto sample_rate_value = std::stoul(s_val);
 			if (sample_rate_value == 0) {
-				alert(L"Validation Error", L"Invalid Sample Rate. Must be a positive number.", MB_ICONERROR);
+				alert(tr(L"Validation Error", L"Ошибка проверки"), tr(L"Invalid Sample Rate. Must be a positive number.", L"Недопустимая частота дискретизации. Нужно положительное число."), MB_ICONERROR);
 				focus(editSampleRate);
 				return false;
 			}
 		}
-		catch (const std::exception&) { alert(L"Validation Error", L"Invalid Sample Rate. Must be a positive number.", MB_ICONERROR); focus(editSampleRate); return false; }
+		catch (const std::exception&) { alert(tr(L"Validation Error", L"Ошибка проверки"), tr(L"Invalid Sample Rate. Must be a positive number.", L"Недопустимая частота дискретизации. Нужно положительное число."), MB_ICONERROR); focus(editSampleRate); return false; }
 
 		ws_val = get_text(editBufferSize); CStringUtils::UnicodeConvert(ws_val, s_val);
 		try { (void)std::stoul(s_val); }
-		catch (const std::exception&) { alert(L"Validation Error", L"Invalid Buffer Size. Must be a number.", MB_ICONERROR); focus(editBufferSize); return false; }
+		catch (const std::exception&) { alert(tr(L"Validation Error", L"Ошибка проверки"), tr(L"Invalid Buffer Size. Must be a number.", L"Недопустимый размер буфера. Нужно число."), MB_ICONERROR); focus(editBufferSize); return false; }
 
 		DWORD kmod_dummy; int kcode_dummy;
 		ws_val = get_text(editHotkeyStartStop); CStringUtils::UnicodeConvert(ws_val, new_hotkey_start_stop);
-		if (!parse_hotkey(new_hotkey_start_stop, kmod_dummy, kcode_dummy)) { alert(L"Validation Error", L"Invalid Start/Stop Hotkey format.", MB_ICONERROR); focus(editHotkeyStartStop); return false; }
+		if (!parse_hotkey(new_hotkey_start_stop, kmod_dummy, kcode_dummy)) { alert(tr(L"Validation Error", L"Ошибка проверки"), tr(L"Invalid Start/Stop Hotkey format.", L"Недопустимый формат клавиши старт/стоп."), MB_ICONERROR); focus(editHotkeyStartStop); return false; }
 
 		ws_val = get_text(editHotkeyPauseResume); CStringUtils::UnicodeConvert(ws_val, new_hotkey_pause_resume);
-		if (!parse_hotkey(new_hotkey_pause_resume, kmod_dummy, kcode_dummy)) { alert(L"Validation Error", L"Invalid Pause/Resume Hotkey format.", MB_ICONERROR); focus(editHotkeyPauseResume); return false; }
+		if (!parse_hotkey(new_hotkey_pause_resume, kmod_dummy, kcode_dummy)) { alert(tr(L"Validation Error", L"Ошибка проверки"), tr(L"Invalid Pause/Resume Hotkey format.", L"Недопустимый формат клавиши пауза/продолжить."), MB_ICONERROR); focus(editHotkeyPauseResume); return false; }
 
 		ws_val = get_text(editHotkeyRestart); CStringUtils::UnicodeConvert(ws_val, new_hotkey_restart);
-		if (!parse_hotkey(new_hotkey_restart, kmod_dummy, kcode_dummy)) { alert(L"Validation Error", L"Invalid Restart Hotkey format.", MB_ICONERROR); focus(editHotkeyRestart); return false; }
+		if (!parse_hotkey(new_hotkey_restart, kmod_dummy, kcode_dummy)) { alert(tr(L"Validation Error", L"Ошибка проверки"), tr(L"Invalid Restart Hotkey format.", L"Недопустимый формат клавиши перезапись."), MB_ICONERROR); focus(editHotkeyRestart); return false; }
 		ws_val = get_text(editHotkeyHideShow); CStringUtils::UnicodeConvert(ws_val, new_hotkey_hide_show);
-		if (!parse_hotkey(new_hotkey_hide_show, kmod_dummy, kcode_dummy)) { alert(L"Validation Error", L"Invalid Hide/Show Hotkey format.", MB_ICONERROR); focus(editHotkeyHideShow); return false; }
+		if (!parse_hotkey(new_hotkey_hide_show, kmod_dummy, kcode_dummy)) { alert(tr(L"Validation Error", L"Ошибка проверки"), tr(L"Invalid Hide/Show Hotkey format.", L"Недопустимый формат клавиши скрыть/показать."), MB_ICONERROR); focus(editHotkeyHideShow); return false; }
 
 
 		ws_val = get_text(editRecordPath);
-		if (ws_val.empty()) { alert(L"Validation Error", L"Record path cannot be empty.", MB_ICONERROR); focus(editRecordPath); return false; }
+		if (ws_val.empty()) { alert(tr(L"Validation Error", L"Ошибка проверки"), tr(L"Record path cannot be empty.", L"Папка записей не может быть пустой."), MB_ICONERROR); focus(editRecordPath); return false; }
 
 		// Audio Format vs Make Stems
 		ws_val = get_text(editAudioFormat);
-		if (ws_val.empty()) { alert(L"Validation Error", L"Audio format cannot be empty.", MB_ICONERROR); focus(editAudioFormat); return false; }
+		if (ws_val.empty()) { alert(tr(L"Validation Error", L"Ошибка проверки"), tr(L"Audio format cannot be empty.", L"Формат аудио не может быть пустым."), MB_ICONERROR); focus(editAudioFormat); return false; }
 		if (is_checked(chkMakeStems) && ws_val != L"wav") {
-			alert(L"Validation Error", L"'Make Stems' is only supported with 'wav' audio format, but you selected '" + ws_val + L"'. Please change audio format to 'wav' or disable 'Make Stems'.", MB_ICONERROR);
+			alert(tr(L"Validation Error", L"Ошибка проверки"), trs(L"'Make Stems' is only supported with 'wav' audio format, but you selected '", L"«Раздельные дорожки» поддерживаются только при формате «wav», а выбран «") + ws_val + tr(L"'. Please change audio format to 'wav' or disable 'Make Stems'.", L"». Переключите формат на wav или отключите раздельные дорожки."), MB_ICONERROR);
 			return false;
 		}
 
@@ -1867,15 +2525,6 @@ public:
 		ws_val = get_text(editAudioFormat); CStringUtils::UnicodeConvert(ws_val, audio_format);
 		audio_format = CStringUtils::ToLowerCase(audio_format);
 		conf.write("General", "audio-format", audio_format);
-		if (audio_format != "wav") {
-			std::string output_ffmpeg_check;
-			if (ExecSystemCmd("ffmpeg.exe -h", output_ffmpeg_check) != 0) {
-				alert(L"FPFFMPegInitializerError", L"ffmpeg.exe not found or inaccessible. Non-WAV formats require FFmpeg. Please install FFmpeg and ensure it's in your system's PATH, or choose WAV format. Reverting to WAV.", MB_ICONERROR);
-				audio_format = "wav";
-				set_text(editAudioFormat, L"wav");
-				conf.write("General", "audio-format", audio_format);
-			}
-		}
 
 
 		sound_events = is_checked(chkSoundEvents) ? MA_TRUE : MA_FALSE;
@@ -1928,8 +2577,35 @@ public:
 			audio_format = command;
 			conf.write("General", "audio-format", audio_format);
 		}
+		// Presets and non-WAV formats need FFmpeg. Offer to install it, and only
+		// then refuse the format (this check must come after the preset-derived
+		// audio-format above, otherwise a preset could slip through unchecked).
+		if (audio_format != "wav" && !EnsureFFmpegAvailable()) {
+			audio_format = "wav";
+			set_text(editAudioFormat, L"wav");
+			conf.write("General", "audio-format", audio_format);
+			current_preset_name = "Default";
+			conf.write("General", "current-preset", current_preset_name);
+			for (const auto& p : g_Presets) {
+				if (p.name == current_preset_name) {
+					g_CurrentPreset = p;
+					break;
+				}
+			}
+			set_list_selection_by_text_internal(listCurrentPreset, L"Default");
+		}
+		if (lblFFmpegStatus) set_text(lblFFmpegStatus, FFmpegStatusText().c_str());
+		std::string language_setting = ui_language::setting_from_list_index(get_list_position(listLanguage));
+		bool language_changed = language_setting != saved_language_setting;
+		conf.write("General", "language", language_setting);
+		saved_language_setting = language_setting;
+
 		CSingleton<CSoundStream>::GetInstance().Reinitialize(); // After a sample rate change
 		conf.save();
+
+		if (language_changed) {
+			alert(tr(L"Settings saved", L"Настройки сохранены"), tr(L"The interface language will change after the application is restarted.", L"Язык интерфейса изменится после перезапуска приложения."), MB_ICONINFORMATION);
+		}
 	}
 };
 
@@ -1958,23 +2634,23 @@ public:
 		int ctrl_height = 25, list_height = 200, label_width = 100, control_width = 300;
 		int y_spacing = 10;
 
-		lblName = create_text(window, L"Source Name:", x_label, y_pos, label_width, ctrl_height, 0); push(lblName);
+		lblName = create_text(window, tr(L"Source Name:", L"Имя источника:"), x_label, y_pos, label_width, ctrl_height, 0); push(lblName);
 		editName = create_input_box(window, false, false, x_control, y_pos, control_width, ctrl_height, 0); push(editName);
 		y_pos += ctrl_height + y_spacing;
 
-		lblDevice = create_text(window, L"Audio Source:", x_label, y_pos, label_width, ctrl_height, 0); push(lblDevice);
+		lblDevice = create_text(window, tr(L"Audio Source:", L"Источник звука:"), x_label, y_pos, label_width, ctrl_height, 0); push(lblDevice);
 		listDevices = create_list(window, x_control, y_pos, control_width, list_height, 0);
 		push(listDevices);
 		y_pos += list_height + y_spacing * 2;
 
 		btnOK = create_button(window, L"OK", x_control, y_pos, 80, 30, 0); push(btnOK);
-		btnCancel = create_button(window, L"Cancel", x_control + 90, y_pos, 80, 30, 0); push(btnCancel);
+		btnCancel = create_button(window, tr(L"Cancel", L"Отмена"), x_control + 90, y_pos, 80, 30, 0); push(btnCancel);
 
 		g_InAudioDevices = get_input_audio_devices();
 		for (const auto& dev : g_InAudioDevices) {
 			if (dev.name == L"Default" || dev.name == L"Not used") continue;
 			DiscoverableSource src;
-			src.display_name = dev.name + L" [Mic]";
+			src.display_name = dev.name + L" [" + source_type_label(DEVICE_CAPTURE) + L"]";
 			src.type = DEVICE_CAPTURE;
 			src.device = dev;
 			available_sources.push_back(src);
@@ -1985,24 +2661,40 @@ public:
 		for (const auto& dev : g_OutAudioDevices) {
 			if (dev.name == L"Not used") continue;
 			DiscoverableSource src;
-			src.display_name = dev.name + L" [Loopback]";
+			src.display_name = dev.name + L" [" + source_type_label(DEVICE_LOOPBACK) + L"]";
 			src.type = DEVICE_LOOPBACK;
 			src.device = dev;
 			available_sources.push_back(src);
 			add_list_item(listDevices, src.display_name.c_str());
 		}
 
-		auto apps = get_tasklist();
-		for (const auto& app : apps) {
-			if (app.id == 0) continue;
-			DiscoverableSource src;
-			src.display_name = app.name + L" (PID: " + std::to_wstring(app.id) + L") [App]";
-			src.type = APP_LOOPBACK;
-			src.app = app;
-			available_sources.push_back(src);
-			add_list_item(listDevices, src.display_name.c_str());
+		// Applications: only visible, titled top-level windows, so the list is
+		// something a human can actually pick from. Falls back to the full
+		// process list when nothing with a window is found.
+		auto apps = get_window_application_list();
+		if (apps.empty()) {
+			apps = get_tasklist();
+			for (const auto& app : apps) {
+				if (app.id == 0) continue;
+				DiscoverableSource src;
+				src.display_name = app.name + L" (PID: " + std::to_wstring(app.id) + L") [" + source_type_label(APP_LOOPBACK) + L"]";
+				src.type = APP_LOOPBACK;
+				src.app = app;
+				available_sources.push_back(src);
+				add_list_item(listDevices, src.display_name.c_str());
+			}
 		}
-
+		else {
+			for (const auto& app : apps) {
+				if (app.id == 0) continue;
+				DiscoverableSource src;
+				src.display_name = app.window_title + L" — " + app.name + L" [" + source_type_label(APP_LOOPBACK) + L"]";
+				src.type = APP_LOOPBACK;
+				src.app = app;
+				available_sources.push_back(src);
+				add_list_item(listDevices, src.display_name.c_str());
+			}
+		}
 
 		focus(editName);
 	}
@@ -2046,6 +2738,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, wchar_t* lpCmd
 	DWORD kmod = -1;
 	int kcode = -1;
 	int result = conf.load();
+	ui_language::select(conf.read("General", "language"));
+	load_configured_sources();
 	if (result == 0) {
 		try {
 			std::string srate = conf.read("General", "sample-rate");
@@ -2057,52 +2751,53 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, wchar_t* lpCmd
 			filename_signature = conf.read("General", "filename-signature");
 			record_path = conf.read("General", "record-path");
 			audio_format = CStringUtils::ToLowerCase(conf.read("General", "audio-format"));
-			if (audio_format != "wav") {
-				std::string output;
-				if (ExecSystemCmd("ffmpeg.exe -h", output) != 0) {
-					alert(L"FPFFMPegInitializerError", L"Get exit code 0 failed for \"ffmpeg.exe\". Either it is not found, or use the wav format.", MB_ICONERROR);
-					g_Retcode = -5;
-					g_Running = false;
-				}
+			if (audio_format != "wav" && !EnsureFFmpegAvailable()) {
+				// Without FFmpeg the program can still record, just not convert.
+				audio_format = "wav";
+				conf.write("General", "audio-format", audio_format);
+				alert(tr(L"FFmpeg unavailable", L"FFmpeg недоступен"),
+					tr(L"FFmpeg is not available, so the audio format has been switched to WAV. Recording will work; conversion and presets will not until FFmpeg is installed.",
+						L"FFmpeg недоступен, поэтому формат аудио переключён на WAV. Запись будет работать; конвертация и пресеты — нет, пока FFmpeg не установлен."),
+					MB_ICONWARNING);
 			}
 
 			std::string sevents = conf.read("General", "sound-events");
 			auto result = str_to_bool(sevents);
 			if (!result.has_value()) {
-				throw std::exception("Failed to parse bool. Either 'true' or 'false' can be used in uppercase or lowercase. Integers are also allowed (0 is false, 1 is true)");
+				throw std::runtime_error("Failed to parse bool. Either 'true' or 'false' can be used in uppercase or lowercase. Integers are also allowed (0 is false, 1 is true)");
 			}
 			sound_events = *result;
 			std::string mstems = conf.read("General", "make-stems");
 			result = str_to_bool(mstems);
 			if (!result.has_value()) {
-				throw std::exception("Failed to parse bool. Either 'true' or 'false' can be used in uppercase or lowercase. Integers are also allowed (0 is false, 1 is true)");
+				throw std::runtime_error("Failed to parse bool. Either 'true' or 'false' can be used in uppercase or lowercase. Integers are also allowed (0 is false, 1 is true)");
 			}
 
 			if (make_stems && audio_format != "wav") {
-				throw std::exception("Can't make stems when using another format, built-in not supported by FPRecorder");
+				throw std::runtime_error("Can't make stems when using another format, built-in not supported by FPRecorder");
 			}
 			std::string sformat = CStringUtils::ToLowerCase(conf.read("General", "sample-format"));
 			bool parse_result = ma_format_convert(sformat.c_str(), buffer_format);
 			if (parse_result == false) {
-				throw std::exception("Invalid sample format parameter");
+				throw std::runtime_error("Invalid sample format parameter");
 			}
 			hotkey_start_stop = conf.read("General", "hotkey-start-stop");
 			if (parse_hotkey(hotkey_start_stop, kmod, kcode) == false) {
-				throw std::exception("Invalid hotkey");
+				throw std::runtime_error("Invalid hotkey");
 			}
 			RegisterHotKey(nullptr, HOTKEY_STARTSTOP, kmod, kcode);
 			hotkey_pause_resume = conf.read("General", "hotkey-pause-resume");
 			if (parse_hotkey(hotkey_pause_resume, kmod, kcode) == false) {
-				throw std::exception("Invalid hotkey");
+				throw std::runtime_error("Invalid hotkey");
 			}
 			RegisterHotKey(nullptr, HOTKEY_PAUSERESUME, kmod, kcode);
 			hotkey_restart = conf.read("General", "hotkey-restart");
 			if (parse_hotkey(hotkey_restart, kmod, kcode) == false) {
-				throw std::exception("Invalid hotkey");
+				throw std::runtime_error("Invalid hotkey");
 			}
 			RegisterHotKey(nullptr, HOTKEY_RESTART, kmod, kcode);
 			if (parse_hotkey(hotkey_hide_show, kmod, kcode) == false) {
-				throw std::exception("Invalid hotkey");
+				throw std::runtime_error("Invalid hotkey");
 			}
 			RegisterHotKey(nullptr, HOTKEY_HIDESHOW, kmod, kcode);
 
@@ -2126,7 +2821,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, wchar_t* lpCmd
 				}
 			}
 			if (!preset_found) {
-				throw std::exception("Invalid preset name");
+				throw std::runtime_error("Invalid preset name");
 			}
 			g_CurrentPreset.name = g_Presets[it].name;
 			g_CurrentPreset.command = g_Presets[it].command;
@@ -2150,7 +2845,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, wchar_t* lpCmd
 			CStringUtils::UnicodeConvert(conf.last_value, last_value_u);
 			if (last_name_u.empty())last_name_u = L"None";
 			if (last_value_u.empty())last_value_u = L"Null";
-			alert(L"FPConfigParsingError", L"An error occurred while loading the existing config file. Error details:\n\"" + what_u + L"\"\nParameter: \"" + last_name_u + L"\".\nValue: \"" + last_value_u + L"\".", MB_ICONERROR);
+			alert(tr(L"FPConfigParsingError", L"Ошибка чтения настроек"), trs(L"An error occurred while loading the existing config file. Error details:\n\"", L"Не удалось прочитать файл настроек. Подробности:\n«") + what_u + tr(L"\"\nParameter: \"", L"»\nПараметр: «") + last_name_u + tr(L"\".\nValue: \"", L"».\nЗначение: «") + last_value_u + tr(L"\".", L"»."), MB_ICONERROR);
 			g_Retcode = -2;
 			g_Running = false;
 		}
@@ -2175,10 +2870,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, wchar_t* lpCmd
 			conf.write("Presets", p.name, p.command);
 		}
 		conf.write("General", "current-preset", current_preset_name);
+		conf.write("General", "language", "auto");
 		conf.save();
 		hotkey_start_stop = conf.read("General", "hotkey-start-stop");
 		if (parse_hotkey(hotkey_start_stop, kmod, kcode) == false) {
-			alert(L"FPConfigParsingError", L"Invalid hotkey.", MB_ICONERROR);
+			alert(tr(L"FPConfigParsingError", L"Ошибка чтения настроек"), tr(L"Invalid hotkey.", L"Недопустимая горячая клавиша."), MB_ICONERROR);
 			g_Retcode = -2;
 			g_Running = false;
 			return g_Retcode;
@@ -2186,7 +2882,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, wchar_t* lpCmd
 		RegisterHotKey(nullptr, HOTKEY_STARTSTOP, kmod, kcode);
 		hotkey_pause_resume = conf.read("General", "hotkey-pause-resume");
 		if (parse_hotkey(hotkey_pause_resume, kmod, kcode) == false) {
-			alert(L"FPConfigParsingError", L"Invalid hotkey.", MB_ICONERROR);
+			alert(tr(L"FPConfigParsingError", L"Ошибка чтения настроек"), tr(L"Invalid hotkey.", L"Недопустимая горячая клавиша."), MB_ICONERROR);
 			g_Retcode = -2;
 			g_Running = false;
 			return g_Retcode;
@@ -2194,7 +2890,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, wchar_t* lpCmd
 		RegisterHotKey(nullptr, HOTKEY_PAUSERESUME, kmod, kcode);
 		hotkey_restart = conf.read("General", "hotkey-restart");
 		if (parse_hotkey(hotkey_restart, kmod, kcode) == false) {
-			alert(L"FPConfigParsingError", L"Invalid hotkey.", MB_ICONERROR);
+			alert(tr(L"FPConfigParsingError", L"Ошибка чтения настроек"), tr(L"Invalid hotkey.", L"Недопустимая горячая клавиша."), MB_ICONERROR);
 			g_Retcode = -2;
 			g_Running = false;
 			return g_Retcode;
@@ -2202,7 +2898,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, wchar_t* lpCmd
 		RegisterHotKey(nullptr, HOTKEY_RESTART, kmod, kcode);
 		hotkey_hide_show = conf.read("General", "hotkey-hide-show");
 		if (parse_hotkey(hotkey_hide_show, kmod, kcode) == false) {
-			alert(L"FPConfigParsingError", L"Invalid hotkey.", MB_ICONERROR);
+			alert(tr(L"FPConfigParsingError", L"Ошибка чтения настроек"), tr(L"Invalid hotkey.", L"Недопустимая горячая клавиша."), MB_ICONERROR);
 			g_Retcode = -2;
 			g_Running = false;
 			return g_Retcode;
@@ -2212,7 +2908,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, wchar_t* lpCmd
 		g_CurrentPreset = g_Presets[0];
 	}
 	try {
-		window = show_window(L"FPRecorder " + version + (IsUserAnAdmin() ? L" (Administrator)" : L""));
+		window = show_window(L"FPRecorder " + version + (IsUserAnAdmin() ? tr(L" (Administrator)", L" (администратор)") : L""));
 		g_MainWindow.build();
 		key_pressed(VK_SPACE) || key_pressed(VK_RETURN); // Avoid click to start recording
 		while (g_Running && window ? true : false) {
@@ -2231,7 +2927,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, wchar_t* lpCmd
 			if (gui::try_close) {
 				gui::try_close = false;
 				if (g_Recording) {
-					alert(L"FPError", L"Can't close the application now. To hide the window, use the Hide/Show hotkey.", MB_ICONWARNING);
+					alert(tr(L"FPError", L"Ошибка"), tr(L"Can't close the application now. To hide the window, use the Hide/Show hotkey.", L"Сейчас приложение закрыть нельзя. Чтобы скрыть окно, нажмите горячую клавишу скрыть/показать."), MB_ICONWARNING);
 					continue;
 				}
 				g_Retcode = 0;
@@ -2252,6 +2948,19 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, wchar_t* lpCmd
 					focus(g_MainWindow.settings_button);
 					g_SettingsMode = false;
 				}
+				else if (is_pressed(g_SettingsWindow.btnDownloadFFmpeg)) {
+					std::wstring error;
+					if (InstallFFmpeg(error)) {
+						alert(tr(L"FFmpeg installed", L"FFmpeg установлен"),
+							trs(L"FFmpeg is installed next to the program: ", L"FFmpeg установлен рядом с программой: ") + (ProgramDir() / L"ffmpeg.exe").wstring(),
+							MB_ICONINFORMATION);
+					}
+					else {
+						alert(tr(L"FFmpeg not installed", L"FFmpeg не установлен"), error, MB_ICONERROR);
+					}
+					set_text(g_SettingsWindow.lblFFmpegStatus, FFmpegStatusText().c_str());
+					key_released(VK_RETURN);
+				}
 				else if (is_pressed(g_SettingsWindow.btnSaveSettings) || key_pressed(VK_RETURN)) {
 					if (g_SettingsWindow.validate_and_prepare_settings()) {
 						g_SettingsWindow.apply();
@@ -2266,7 +2975,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, wchar_t* lpCmd
 					OleInitialize(NULL);
 					BROWSEINFOW bi = { 0 };
 					bi.hwndOwner = window;
-					bi.lpszTitle = L"Select Recording Folder";
+					bi.lpszTitle = tr(L"Select Recording Folder", L"Выберите папку для записей");
 					bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_USENEWUI;
 
 					wchar_t currentPathBuffer[MAX_PATH];
@@ -2334,7 +3043,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, wchar_t* lpCmd
 				if (key_pressed(VK_DELETE) or is_pressed(g_RecordManagerWindow.delete_button)) {
 					if (get_focused_list_item_name(g_RecordManagerWindow.items_view_list) == L"")continue;
 					wait(10);
-					int result = alert(L"FPWarning", L"Are you sure you want to delete the recording \"" + get_focused_list_item_name(g_RecordManagerWindow.items_view_list) + L"\"? It can no longer be restored.", MB_YESNO | MB_ICONEXCLAMATION);
+					int result = alert(tr(L"FPWarning", L"Предупреждение"), trs(L"Are you sure you want to delete the recording \"", L"Удалить запись «") + get_focused_list_item_name(g_RecordManagerWindow.items_view_list) + tr(L"\"? It can no longer be restored.", L"»? Восстановить её будет невозможно."), MB_YESNO | MB_ICONEXCLAMATION);
 					if (result == IDNO)continue;
 					else if (result == IDYES)
 					{
@@ -2355,26 +3064,50 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, wchar_t* lpCmd
 					g_AddingSourceMode = true;
 				}
 
+				if (is_pressed(g_MainWindow.toggle_source_btn) ||
+					(key_pressed(VK_SPACE) && get_current_focus() == g_MainWindow.sources_list)) {
+					g_MainWindow.toggle_selected_source();
+				}
+
 				if (is_pressed(g_MainWindow.remove_source_btn)) {
 					int selection = get_list_position(g_MainWindow.sources_list);
 					if (selection >= 0 && static_cast<size_t>(selection) < g_ConfiguredSources.size()) {
 						g_ConfiguredSources.erase(g_ConfiguredSources.begin() + selection);
 						g_MainWindow.update_sources_list();
+						save_configured_sources();
 					}
 				}
 
 				if (is_pressed(g_MainWindow.record_start) || hotkey_pressed(HOTKEY_STARTSTOP) || g_CommandLineOptions.start) {
-					if (!g_ConfiguredSources.empty()) {
-						if (sound_events) g_SoundStream.PlayEvent(CSoundStream::SOUND_EVENT_START_RECORDING);
+					bool any_enabled = false;
+					for (const ConfiguredSource& source : g_ConfiguredSources) {
+						if (source.enabled) { any_enabled = true; break; }
+					}
+					if (any_enabled && audio_format != "wav" && !EnsureFFmpegAvailable()) {
+						if (sound_events) g_SoundStream.PlayEvent(CSoundStream::SOUND_EVENT_ERROR);
+					}
+					else if (any_enabled) {
+						std::vector<ConfiguredSource> resolved_sources;
+						if (prepare_sources_for_recording(resolved_sources)) {
+							if (sound_events) g_SoundStream.PlayEvent(CSoundStream::SOUND_EVENT_START_RECORDING);
 
-						g_MainWindow.reset();
-						g_RecordingWindow.build();
-						g_AudioRecorder.start(g_ConfiguredSources);
-						g_RecordingPaused = false;
+							g_MainWindow.reset();
+							g_RecordingWindow.build();
+							g_AudioRecorder.start(resolved_sources);
+							g_RecordingPaused = false;
+						}
+						else if (sound_events) {
+							g_SoundStream.PlayEvent(CSoundStream::SOUND_EVENT_ERROR);
+						}
 					}
 					else {
 						if (sound_events)		g_SoundStream.PlayEvent(CSoundStream::SOUND_EVENT_ERROR);
-						alert(L"FPError", L"No sources yet. Please add a new source by pressing 'Add Source...' button.", MB_ICONWARNING);
+						if (g_ConfiguredSources.empty()) {
+							alert(tr(L"FPError", L"Ошибка"), tr(L"No sources yet. Please add a new source by pressing 'Add Source...' button.", L"Источников пока нет. Добавьте источник кнопкой «Добавить источник...»."), MB_ICONWARNING);
+						}
+						else {
+							alert(tr(L"FPError", L"Ошибка"), tr(L"All sources are switched off. Switch at least one on in the list: select it and press Space, or use the 'On / off' button.", L"Все источники выключены. Включите хотя бы один в списке: выберите его и нажмите пробел, или кнопка «Вкл/выкл»."), MB_ICONWARNING);
+						}
 					}
 				}
 			}
@@ -2391,11 +3124,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, wchar_t* lpCmd
 					int selection_idx = get_list_position(g_AddSourceWindow.listDevices);
 
 					if (name.empty()) {
-						alert(L"Input Error", L"Please provide a name for the source.", MB_ICONWARNING);
+						alert(tr(L"Input Error", L"Ошибка ввода"), tr(L"Please provide a name for the source.", L"Укажите имя источника."), MB_ICONWARNING);
 						focus(g_AddSourceWindow.editName);
 					}
 					else if (selection_idx < 0) {
-						alert(L"Input Error", L"Please select a valid audio source.", MB_ICONWARNING);
+						alert(tr(L"Input Error", L"Ошибка ввода"), tr(L"Please select a valid audio source.", L"Выберите источник звука из списка."), MB_ICONWARNING);
 						focus(g_AddSourceWindow.listDevices);
 					}
 					else {
@@ -2406,8 +3139,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, wchar_t* lpCmd
 						new_source.device = selected_source.device;
 						new_source.app.id = selected_source.app.id;
 						new_source.app.name = selected_source.app.name;
+						new_source.app.window_title = selected_source.app.window_title;
 
 						g_ConfiguredSources.push_back(new_source);
+						save_configured_sources();
 
 						g_MainWindow.update_sources_list();
 						g_AddSourceWindow.reset();
@@ -2424,7 +3159,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, wchar_t* lpCmd
 				g_Recording = false;
 				g_RecordingWindow.reset();
 				if (audio_format == CStringUtils::ToLowerCase("jkm")) {
-					alert(L"FPInteractiveAudioConverter", L"JKM - Jigsaw Kompression Media V 99.54.2. This audio format will be in 2015, October 95 at 3 hours -19 minutes.", MB_ICONHAND);
+					alert(tr(L"FPInteractiveAudioConverter", L"Ошибка конвертации"), L"JKM - Jigsaw Kompression Media V 99.54.2. This audio format will be in 2015, October 95 at 3 hours -19 minutes.", MB_ICONHAND);
 					g_Retcode = -256;
 					g_Running = false;
 				}
@@ -2432,7 +3167,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, wchar_t* lpCmd
 				else if (audio_format != CStringUtils::ToLowerCase("wav")) {
 					string output;
 					std::vector<std::string> split = CStringUtils::Split(".wav", g_AudioRecorder.base_filename);
-					std::string cmd = g_CurrentPreset.command;
+					std::string cmd = ApplyFFmpegPath(g_CurrentPreset.command);
 					CStringUtils::Replace(cmd, "%I", "\"" + g_AudioRecorder.base_filename + ".wav\"", true);
 					CStringUtils::Replace(cmd, "%i", "\"" + split[0] + "\"", true);
 					CStringUtils::Replace(cmd, "%f", audio_format, true);
@@ -2442,7 +3177,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, wchar_t* lpCmd
 						if (sound_events)		g_SoundStream.PlayEvent(CSoundStream::SOUND_EVENT_ERROR);
 						wstring output_u;
 						CStringUtils::UnicodeConvert(output, output_u);
-						alert(L"FPError", L"Process exit failure!\nRetcode: " + std::to_wstring(result) + L"\nOutput: \"" + output_u + L"\".", MB_ICONERROR);
+						alert(tr(L"FPError", L"Ошибка"), trs(L"Process exit failure!\nRetcode: ", L"Команда завершилась с ошибкой!\nКод: ") + std::to_wstring(result) + tr(L"\nOutput: \"", L"\nВывод: «") + output_u + tr(L"\".", L"»."), MB_ICONERROR);
 					}
 					else {
 						std::wstring recording_name_u;
@@ -2459,13 +3194,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, wchar_t* lpCmd
 					g_AudioRecorder.pause();
 					if (sound_events)		g_SoundStream.PlayEvent(CSoundStream::SOUND_EVENT_PAUSE_RECORDING);
 					g_RecordingPaused = true;
-					set_text(g_RecordingWindow.record_pause, std::wstring(L"Resume recording (" + wsHkPauseResume + L")").c_str());
+					set_text(g_RecordingWindow.record_pause, (trs(L"Resume recording ", L"Продолжить запись ") + L"(" + wsHkPauseResume + L")").c_str());
 				}
 				else if (g_RecordingPaused) {
 					if (sound_events)		g_SoundStream.PlayEvent(CSoundStream::SOUND_EVENT_RESUME_RECORDING);
 					g_AudioRecorder.resume();
 					g_RecordingPaused = false;
-					set_text(g_RecordingWindow.record_pause, std::wstring(L"Pause recording (" + wsHkPauseResume + L")").c_str());
+					set_text(g_RecordingWindow.record_pause, (trs(L"Pause recording ", L"Пауза записи ") + L"(" + wsHkPauseResume + L")").c_str());
 				}
 				wait(20);
 			}
@@ -2473,13 +3208,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, wchar_t* lpCmd
 				wait(10);
 				std::wstring recording_name_u;
 				CStringUtils::UnicodeConvert(g_AudioRecorder.base_filename, recording_name_u);
-				int result = alert(L"FPWarning", L"Are you sure you want to delete the recording \"" + recording_name_u + L"\" and rerecord it to new one? Old record can no longer be restored.", MB_YESNO | MB_ICONEXCLAMATION);
+				int result = alert(tr(L"FPWarning", L"Предупреждение"), trs(L"Are you sure you want to delete the recording \"", L"Удалить запись «") + recording_name_u + tr(L"\" and rerecord it to new one? Old record can no longer be restored.", L"» и записать заново? Старую запись восстановить будет невозможно."), MB_YESNO | MB_ICONEXCLAMATION);
 				if (result == IDNO)continue;
 				else if (result == IDYES)
 				{
 					g_AudioRecorder.stop();
 				}
-				g_AudioRecorder.start(g_ConfiguredSources);
+				std::vector<ConfiguredSource> resolved_sources;
+				if (!prepare_sources_for_recording(resolved_sources)) {
+					if (sound_events) g_SoundStream.PlayEvent(CSoundStream::SOUND_EVENT_ERROR);
+					continue;
+				}
+				g_AudioRecorder.start(resolved_sources);
 				g_Recording = true;
 				g_RecordingPaused = false;
 				window_reset();
@@ -2506,7 +3246,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, wchar_t* lpCmd
 		ss << std::stacktrace::current();
 		CStringUtils::UnicodeConvert(ss.str(), exception_u);
 		if (sound_events)		g_SoundStream.PlayEvent(CSoundStream::SOUND_EVENT_ERROR);
-		alert(L"FPRuntimeError", exception_u.c_str(), MB_ICONERROR);
+		alert(tr(L"FPRuntimeError", L"Критическая ошибка"), exception_u.c_str(), MB_ICONERROR);
 		g_Running = false;
 		g_Retcode = -100;
 	}
@@ -2537,7 +3277,7 @@ LONG WINAPI ExceptionHandler(EXCEPTION_POINTERS* exceptionInfo) {
 	std::wstring str_u;
 	CStringUtils::UnicodeConvert(ss.str(), str_u);
 	if (sound_events)		g_SoundStream.PlayEvent(CSoundStream::SOUND_EVENT_ERROR);
-	alert(L"FPRuntimeError", str_u, MB_ICONERROR);
+	alert(tr(L"FPRuntimeError", L"Критическая ошибка"), str_u, MB_ICONERROR);
 	g_Retcode = -100;
 	g_Running = false; // In any situation, user should nott lost the record. Give application call audio recorder destructor to try uninitialize the encoder
 	return 0;

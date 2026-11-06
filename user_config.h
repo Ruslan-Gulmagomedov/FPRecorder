@@ -83,6 +83,10 @@ public:
 	void write(const std::string& section, const std::string& key, const std::string& value) {
 		data[section][key] = value; // Update or insert the key-value pair
 	}
+	// Remove a whole section (used to rewrite [Sources] from scratch)
+	void clear_section(const std::string& section) {
+		data.erase(section);
+	}
 	std::vector<std::string> get_keys(const std::string& section) {
 		std::vector<std::string> keys;
 		auto sec_it = data.find(section);
